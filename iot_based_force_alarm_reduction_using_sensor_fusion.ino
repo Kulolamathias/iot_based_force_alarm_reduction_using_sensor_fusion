@@ -1,12 +1,13 @@
 /**
- * @file project.ino
+ * @file iot_based_force_alarm_reduction_using_sensor_fusion.ino
  * @brief Main entry point for the gas leak detection system.
  * 
  * Features:
  * - MQ‑2 and MQ‑5 analogue gas sensors (with PPM conversion)
  * - DHT22 temperature & humidity
- * - Buzzer, RGB‑like LEDs (red = full alarm, yellow = warning, green = safe)
- * - Relay to cut gas valve on full alarm
+ * - Buzzer with different patterns for full alarm vs warning
+ * - LEDs: red = full alarm, yellow = warning, green = safe
+ * - Relay cuts gas valve only on full alarm
  * - WiFi + MQTT for remote monitoring and control
  * - Intelligent false‑alarm reduction (cooking scenario detection)
  */
@@ -27,24 +28,43 @@
 #define YELLOW_LED_PIN   15    // warning (false leak) indicator
 #define RELAY_PIN        10    // 
 
-// ==================== SENSOR THRESHOLDS ====================
-#define MQ2_THRESHOLD_RAW    1000   // raw ADC value (0‑4095) – gas present if above
-#define MQ5_THRESHOLD_RAW    600
+// ==================== GAS SENSOR THRESHOLDS (RAW ADC) ====================
+// Full alarm (dangerous gas) thresholds
+#define MQ2_ALARM_RAW       1000   // raw ADC value (0‑4095)
+#define MQ5_ALARM_RAW       600
 
-// PPM thresholds for alarming (more accurate than raw ADC)
-#define MQ2_PPM_THRESHOLD    200   // ppm of LPG/smoke to trigger alarm
-#define MQ5_PPM_THRESHOLD    150   // ppm of LPG
+// Warning (possible false leak) thresholds – lower than alarm
+#define MQ2_WARNING_RAW     600    // above this triggers warning zone
+#define MQ5_WARNING_RAW     400
+
+// ==================== GAS SENSOR THRESHOLDS (PPM) ====================
+// Optional: use PPM instead of raw for more accurate detection
+#define MQ2_ALARM_PPM       200    // ppm of LPG/smoke to trigger full alarm
+#define MQ5_ALARM_PPM       150
+#define MQ2_WARNING_PPM     80     // ppm to trigger warning zone
+#define MQ5_WARNING_PPM     60
+
+// Choose which method to use for detection (RAW or PPM)
+#define USE_PPM_FOR_DETECTION false   // set to true if you prefer PPM
 
 // ==================== ENVIRONMENTAL THRESHOLDS ====================
 #define TEMP_WARNING_THRESHOLD      35.0f   // °C – cooking suspicion
 #define HUMIDITY_WARNING_THRESHOLD  80.0f   // %RH
 
-// ==================== BUZZER ====================
+// ==================== BUZZER PATTERNS ====================
 #define BUZZER_FREQ         2000   // Hz
+// Full alarm pattern: fast beep (ms on, ms off)
+#define ALARM_BEEP_ON       300
+#define ALARM_BEEP_OFF      300
+// Warning pattern: polite single short beep, long pause
+#define WARNING_BEEP_ON     100
+#define WARNING_BEEP_OFF    1900
 
 // ==================== WIFI & MQTT ====================
-#define WIFI_SSID           "Mathias' Sxx U..."
-#define WIFI_PASSWORD       "1234567890223"
+// #define WIFI_SSID           "Mathias' Sxx U..."
+// #define WIFI_PASSWORD       "1234567890223"
+#define WIFI_SSID           "pixel 3a"
+#define WIFI_PASSWORD       "123@Amoni"
 #define MQTT_BROKER         "102.223.8.140"
 #define MQTT_PORT           1883
 #define MQTT_USERNAME       "mqtt_user"
@@ -54,9 +74,10 @@
 #define MQTT_TOPIC_COMMAND  "gas_alarm/command"
 
 // ==================== GLOBAL OBJECTS ====================
-GasSensor       gasSensor(MQ2_PIN, MQ5_PIN, MQ2_THRESHOLD_RAW, MQ5_THRESHOLD_RAW);
+GasSensor       gasSensor(MQ2_PIN, MQ5_PIN, MQ2_ALARM_RAW, MQ5_ALARM_RAW);
 DHT22Sensor     dhtSensor(DHTPIN);
-AlarmManager    alarmManager(BUZZER_PIN, RED_LED_PIN, GREEN_LED_PIN, YELLOW_LED_PIN, RELAY_PIN, BUZZER_FREQ);
+AlarmManager    alarmManager(BUZZER_PIN, RED_LED_PIN, GREEN_LED_PIN, YELLOW_LED_PIN, RELAY_PIN, 
+                             BUZZER_FREQ, ALARM_BEEP_ON, ALARM_BEEP_OFF, WARNING_BEEP_ON, WARNING_BEEP_OFF);
 
 WiFiClient      wifiClient;
 PubSubClient    mqttClient(wifiClient);
@@ -105,51 +126,68 @@ void loop() {
   
   int mq2Raw = gasSensor.readMQ2();
   int mq5Raw = gasSensor.readMQ5();
-  
-  // Convert raw ADC to PPM (using sensor‑specific formulas)
   float mq2PPM = gasSensor.readMQ2_PPM();
   float mq5PPM = gasSensor.readMQ5_PPM();
   
-  // Gas detection logic (using raw OR ppm thresholds – you can choose)
-  bool gasDetected = gasSensor.isGasDetected();           // raw threshold
-  // Alternatively use PPM: (mq2PPM >= MQ2_PPM_THRESHOLD || mq5PPM >= MQ5_PPM_THRESHOLD);
+  // 2. Determine gas level using either RAW or PPM (configurable)
+  bool isGasAlarm = false;
+  bool isGasWarning = false;
   
-  // 2. Debug output
+#if USE_PPM_FOR_DETECTION
+  isGasAlarm = (mq2PPM >= MQ2_ALARM_PPM) || (mq5PPM >= MQ5_ALARM_PPM);
+  isGasWarning = (!isGasAlarm) && ((mq2PPM >= MQ2_WARNING_PPM) || (mq5PPM >= MQ5_WARNING_PPM));
+#else
+  isGasAlarm = (mq2Raw >= MQ2_ALARM_RAW) || (mq5Raw >= MQ5_ALARM_RAW);
+  isGasWarning = (!isGasAlarm) && ((mq2Raw >= MQ2_WARNING_RAW) || (mq5Raw >= MQ5_WARNING_RAW));
+#endif
+  
+  bool isCookingScenario = (temperature >= TEMP_WARNING_THRESHOLD) ||
+                           (humidity >= HUMIDITY_WARNING_THRESHOLD);
+  
+  // 3. Decision logic
+  if (isGasAlarm) {
+    alarmManager.triggerFullAlarm();
+    Serial.println("-> FULL ALARM – dangerous gas level!");
+  }
+  else if (isGasWarning) {
+    if (isCookingScenario) {
+      alarmManager.triggerWarningOnly();
+      Serial.println("-> WARNING ONLY (cooking / high temp/humidity)");
+    } else {
+      // Low gas with normal environment – still warn but politely
+      alarmManager.triggerWarningOnly();
+      Serial.println("-> LOW GAS WARNING (polite alert)");
+    }
+  }
+  else {
+    alarmManager.returnToSafe();
+  }
+  
+  // 4. Update alarm hardware (buzzer, LEDs, relay)
+  alarmManager.update();
+  
+  // 5. Debug output
   Serial.print("Temp: "); Serial.print(temperature); Serial.print(" °C | ");
   Serial.print("Humidity: "); Serial.print(humidity); Serial.print(" % | ");
   Serial.print("MQ2 raw: "); Serial.print(mq2Raw); Serial.print(" (");
   Serial.print(mq2PPM); Serial.print(" ppm) | ");
   Serial.print("MQ5 raw: "); Serial.print(mq5Raw); Serial.print(" (");
   Serial.print(mq5PPM); Serial.print(" ppm) | ");
-  Serial.print("Gas detected: "); Serial.println(gasDetected ? "YES" : "NO");
+  Serial.print("Gas: ");
+  if (isGasAlarm) Serial.print("ALARM");
+  else if (isGasWarning) Serial.print("WARNING");
+  else Serial.print("SAFE");
+  Serial.println();
   
-  // 3. Intelligent decision logic
-  if (gasDetected) {
-    bool isCookingScenario = (temperature >= TEMP_WARNING_THRESHOLD) ||
-                             (humidity >= HUMIDITY_WARNING_THRESHOLD);
-    
-    if (isCookingScenario) {
-      alarmManager.triggerWarningOnly();   // false leak: yellow LED, buzzer, valve open
-      Serial.println("-> WARNING ONLY (cooking / high temp/humidity)");
-    } else {
-      alarmManager.triggerFullAlarm();     // true leak: red LED, buzzer, valve closed
-      Serial.println("-> FULL ALARM – gas valve closed!");
-    }
-  } else {
-    alarmManager.returnToSafe();           // no gas -> green LED, valve open
-  }
-  
-  // 4. Update alarm hardware (buzzer, LEDs, relay)
-  alarmManager.update();
-  
-  // 5. Publish MQTT status periodically
+  // 6. Publish MQTT status
   if (millis() - lastMqttPublish >= MQTT_PUBLISH_INTERVAL) {
     lastMqttPublish = millis();
-    const char* stateStr = alarmManager.getStateString(); // you need to add this method
-    publishStatus(temperature, humidity, mq2Raw, mq5Raw, mq2PPM, mq5PPM, gasDetected, stateStr);
+    const char* stateStr = alarmManager.getStateString();
+    bool anyGas = isGasAlarm || isGasWarning;
+    publishStatus(temperature, humidity, mq2Raw, mq5Raw, mq2PPM, mq5PPM, anyGas, stateStr);
   }
   
-  delay(200);  // smaller delay for responsive MQTT
+  delay(200);
 }
 
 // ==================== WIFI CONNECTION ====================
@@ -179,9 +217,8 @@ void connectMQTT() {
   }
 }
 
-// ==================== MQTT CALLBACK (receive commands) ====================
+// ==================== MQTT CALLBACK ====================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Convert payload to string
   char message[length + 1];
   for (unsigned int i = 0; i < length; i++) {
     message[i] = (char)payload[i];
@@ -192,13 +229,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("MQTT command received: ");
   Serial.println(msgStr);
   
-  // Simple JSON parsing (you can use ArduinoJson library for complex commands)
   if (msgStr.indexOf("\"command\":\"set_thresholds\"") != -1) {
-    // Extract values – this is basic; for production use ArduinoJson
-    int newMq2 = msgStr.substring(msgStr.indexOf("\"mq2\":") + 6).toInt();
-    int newMq5 = msgStr.substring(msgStr.indexOf("\"mq5\":") + 6).toInt();
+    int newMq2 = msgStr.substring(msgStr.indexOf("\"mq2_alarm\":") + 11).toInt();
+    int newMq5 = msgStr.substring(msgStr.indexOf("\"mq5_alarm\":") + 11).toInt();
     gasSensor.setThresholds(newMq2, newMq5);
-    Serial.print("Updated thresholds: MQ2=");
+    Serial.print("Updated alarm thresholds: MQ2=");
     Serial.print(newMq2);
     Serial.print(", MQ5=");
     Serial.println(newMq5);
@@ -217,14 +252,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     alarmManager.silenceBuzzer(duration * 1000UL);
   }
   else if (msgStr.indexOf("\"command\":\"get_status\"") != -1) {
-    // Force a publish immediately (will happen on next loop iteration)
     lastMqttPublish = 0;
   }
 }
 
 // ==================== PUBLISH STATUS VIA MQTT ====================
 void publishStatus(float temp, float hum, int mq2Raw, int mq5Raw, float mq2PPM, float mq5PPM, bool gasDetected, const char* alarmState) {
-  // Build JSON string (manually – for simplicity)
   String json = "{";
   json += "\"timestamp_ms\":" + String(millis()) + ",";
   json += "\"temperature_c\":" + String(temp, 1) + ",";

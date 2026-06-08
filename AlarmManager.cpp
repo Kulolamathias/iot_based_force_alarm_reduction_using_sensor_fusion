@@ -1,12 +1,18 @@
 #include "AlarmManager.h"
 
-AlarmManager::AlarmManager(uint8_t buzzerPin, uint8_t redLedPin, uint8_t greenLedPin, uint8_t yellowLedPin, uint8_t relayPin, int buzzerFreq) {
+AlarmManager::AlarmManager(uint8_t buzzerPin, uint8_t redLedPin, uint8_t greenLedPin, uint8_t yellowLedPin, 
+                           uint8_t relayPin, int buzzerFreq, int alarmBeepOn, int alarmBeepOff,
+                           int warningBeepOn, int warningBeepOff) {
   _buzzerPin = buzzerPin;
   _redLedPin = redLedPin;
   _greenLedPin = greenLedPin;
   _yellowLedPin = yellowLedPin;
   _relayPin = relayPin;
   _buzzerFreq = buzzerFreq;
+  _alarmBeepOn = alarmBeepOn;
+  _alarmBeepOff = alarmBeepOff;
+  _warningBeepOn = warningBeepOn;
+  _warningBeepOff = warningBeepOff;
   _currentState = STATE_SAFE;
   _targetState = STATE_SAFE;
   _lastGasLostTime = 0;
@@ -56,41 +62,46 @@ void AlarmManager::forceSafe() {
 
 void AlarmManager::silenceBuzzer(unsigned long durationMs) {
   _buzzerSilencedUntil = millis() + durationMs;
-  // Immediately turn off buzzer if it was on
   ledcWriteTone(_buzzerPin, 0);
   _buzzerOn = false;
 }
 
 void AlarmManager::update() {
-  // State transition
   if (_currentState != _targetState) {
     _currentState = _targetState;
     _updateOutputs();
   }
   
-  // Buzzer control (respect silence period)
   bool buzzerMuted = (_buzzerSilencedUntil > millis());
   
   if (!buzzerMuted && _currentState != STATE_SAFE) {
     unsigned long now = millis();
-    if ((now - _lastBuzzerToggle) >= 500) {
-      _lastBuzzerToggle = now;
-      _buzzerOn = !_buzzerOn;
-      if (_buzzerOn) {
-        ledcWriteTone(_buzzerPin, _buzzerFreq);
-      } else {
+    int beepOn = (_currentState == STATE_FULL_ALARM) ? _alarmBeepOn : _warningBeepOn;
+    int beepOff = (_currentState == STATE_FULL_ALARM) ? _alarmBeepOff : _warningBeepOff;
+    int cycleDuration = beepOn + beepOff;
+    
+    if (_buzzerOn) {
+      // Currently beeping – check if it's time to turn off
+      if (now - _lastBuzzerToggle >= beepOn) {
         ledcWriteTone(_buzzerPin, 0);
+        _buzzerOn = false;
+        _lastBuzzerToggle = now;
+      }
+    } else {
+      // Currently silent – check if it's time to beep
+      if (now - _lastBuzzerToggle >= beepOff) {
+        ledcWriteTone(_buzzerPin, _buzzerFreq);
+        _buzzerOn = true;
+        _lastBuzzerToggle = now;
       }
     }
   } else {
-    // If muted or safe, ensure buzzer off
     ledcWriteTone(_buzzerPin, 0);
     _buzzerOn = false;
   }
 }
 
 void AlarmManager::_updateOutputs() {
-  // Turn off all LEDs first (common anode/cathode? We use active HIGH)
   digitalWrite(_greenLedPin, LOW);
   digitalWrite(_redLedPin, LOW);
   digitalWrite(_yellowLedPin, LOW);
@@ -98,17 +109,17 @@ void AlarmManager::_updateOutputs() {
   switch (_currentState) {
     case STATE_SAFE:
       digitalWrite(_greenLedPin, HIGH);
-      digitalWrite(_relayPin, HIGH);   // valve open
+      digitalWrite(_relayPin, HIGH);
       break;
       
     case STATE_WARNING_ONLY:
       digitalWrite(_yellowLedPin, HIGH);
-      digitalWrite(_relayPin, HIGH);   // valve stays open
+      digitalWrite(_relayPin, HIGH);
       break;
       
     case STATE_FULL_ALARM:
       digitalWrite(_redLedPin, HIGH);
-      digitalWrite(_relayPin, LOW);    // valve closed
+      digitalWrite(_relayPin, LOW);
       break;
   }
 }
